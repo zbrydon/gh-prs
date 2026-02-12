@@ -1,35 +1,115 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -e
 
-echo "Hello gh-prs!"
+INCLUDE_DRAFTS=false
+REVIEW_REQUESTS=false
 
-# Snippets to help get started:
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --drafts)
+      INCLUDE_DRAFTS=true
+      shift
+      ;;
+    --req)
+      REVIEW_REQUESTS=true
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $0 [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --drafts    Include draft PRs in output"
+      echo "  --req       Show PRs where you're requested to review (default: your own PRs)"
+      echo "  -h, --help  Show this help message"
+      exit 0
+      ;;
+    *)
+      echo "Error: Unknown option: $1" >&2
+      echo "Run '$0 --help' for usage information" >&2
+      exit 1
+      ;;
+  esac
+done
 
-# Determine if an executable is in the PATH
-# if ! type -p ruby >/dev/null; then
-#   echo "Ruby not found on the system" >&2
-#   exit 1
-# fi
+if ! command -v gh &> /dev/null; then
+  echo "Error: GitHub CLI (gh) is not installed" >&2
+  echo "Install it from: https://cli.github.com/" >&2
+  exit 1
+fi
 
-# Pass arguments through to another command
-# gh issue list "$@" -R cli/cli
+if ! gh auth status &> /dev/null; then
+  echo "Error: Not authenticated with GitHub CLI" >&2
+  echo "Run: gh auth login" >&2
+  exit 1
+fi
 
-# Using the gh api command to retrieve and format information
-# QUERY='
-#   query($endCursor: String) {
-#     viewer {
-#       repositories(first: 100, after: $endCursor) {
-#         nodes {
-#           nameWithOwner
-#           stargazerCount
-#         }
-#       }
-#     }
-#   }
-# '
-# TEMPLATE='
-#   {{- range $repo := .data.viewer.repositories.nodes -}}
-#     {{- printf "name: %s - stargazers: %v\n" $repo.nameWithOwner $repo.stargazerCount -}}
-#   {{- end -}}
-# '
-# exec gh api graphql -f query="${QUERY}" --paginate --template="${TEMPLATE}"
+if [ "$REVIEW_REQUESTS" = "true" ]; then
+  # PRs where viewer is requested to review
+  query='query {
+    search(first: 100, type: ISSUE, query: "type:pr state:open review-requested:@me -author:app/renovate") {
+      nodes {
+        ... on PullRequest {
+          number
+          title
+          url
+          isDraft
+          repository {
+            nameWithOwner
+          }
+          author {
+            login
+          }
+        }
+      }
+    }
+  }'
+
+  if [ "$INCLUDE_DRAFTS" = "true" ]; then
+    template='{{range .data.search.nodes -}}
+{{$draft := "" -}}
+{{if .isDraft -}}{{$draft = "DRAFT" -}}{{end -}}
+{{tablerow (printf "#%v" .number | autocolor "green") .title (.repository.nameWithOwner | autocolor "blue") (.author.login | autocolor "yellow") ($draft | autocolor "magenta") (.url | autocolor "cyan") -}}
+{{end -}}
+{{tablerender}}'
+  else
+    template='{{range .data.search.nodes -}}
+{{if not .isDraft -}}
+{{tablerow (printf "#%v" .number | autocolor "green") .title (.repository.nameWithOwner | autocolor "blue") (.author.login | autocolor "yellow") (.url | autocolor "cyan") -}}
+{{end -}}
+{{end -}}
+{{tablerender}}'
+  fi
+else
+  # Viewer's own PRs
+  query='query {
+    viewer {
+      pullRequests(first: 100, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+        nodes {
+          number
+          title
+          reviewDecision
+          isDraft
+          url
+        }
+      }
+    }
+  }'
+
+  if [ "$INCLUDE_DRAFTS" = "true" ]; then
+    template='{{range .data.viewer.pullRequests.nodes -}}
+{{$draft := "" -}}
+{{if .isDraft -}}{{$draft = "DRAFT" -}}{{end -}}
+{{tablerow (printf "#%v" .number | autocolor "green") .title (.reviewDecision | autocolor "yellow") ($draft | autocolor "magenta") (.url | autocolor "cyan") -}}
+{{end -}}
+{{tablerender}}'
+  else
+    template='{{range .data.viewer.pullRequests.nodes -}}
+{{if not .isDraft -}}
+{{tablerow (printf "#%v" .number | autocolor "green") .title (.reviewDecision | autocolor "yellow") (.url | autocolor "cyan") -}}
+{{end -}}
+{{end -}}
+{{tablerender}}'
+  fi
+fi
+
+exec gh api graphql --paginate -f query="$query" -t "$template"
