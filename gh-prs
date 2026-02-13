@@ -18,7 +18,7 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
-      echo "  --drafts    Include draft PRs in output"
+      echo "  --drafts    Show ONLY draft PRs (mutually exclusive with non-drafts)"
       echo "  --req       Show PRs where you're requested to review (default: your own PRs)"
       echo "  -h, --help  Show this help message"
       exit 0
@@ -36,51 +36,63 @@ if ! command -v gh &> /dev/null; then
   echo "Install it from: https://cli.github.com/" >&2
   exit 1
 fi
-
 if ! gh auth status &> /dev/null; then
   echo "Error: Not authenticated with GitHub CLI" >&2
   echo "Run: gh auth login" >&2
   exit 1
 fi
+if ! command -v jq &> /dev/null; then
+  echo "Error: jq is not installed" >&2
+  echo "Install it from: https://stedolan.github.io/jq/" >&2
+  exit 1
+fi
 
 if [ "$REVIEW_REQUESTS" = "true" ]; then
-  # PRs where viewer is requested to review
-  query='query {
-    search(first: 100, type: ISSUE, query: "type:pr state:open review-requested:@me -author:app/renovate") {
-      nodes {
-        ... on PullRequest {
-          number
-          title
-          url
-          isDraft
-          repository {
-            nameWithOwner
-          }
-          author {
-            login
-          }
-        }
-      }
-    }
-  }'
+    current_user=$(gh api user --jq '.login')
+    teams=$(gh api user/teams --jq '.[] | .organization.login + "/" + .slug')
 
-  if [ "$INCLUDE_DRAFTS" = "true" ]; then
-    template='{{range .data.search.nodes -}}
-{{$draft := "" -}}
-{{if .isDraft -}}{{$draft = "DRAFT" -}}{{end -}}
-{{tablerow (printf "#%v" .number | autocolor "green") .title (.repository.nameWithOwner | autocolor "blue") (.author.login | autocolor "yellow") ($draft | autocolor "magenta") (.url | autocolor "cyan") -}}
-{{end -}}
-{{tablerender}}'
-  else
-    template='{{range .data.search.nodes -}}
-{{if not .isDraft -}}
-{{tablerow (printf "#%v" .number | autocolor "green") .title (.repository.nameWithOwner | autocolor "blue") (.author.login | autocolor "yellow") (.url | autocolor "cyan") -}}
-{{end -}}
-{{end -}}
-{{tablerender}}'
-  fi
+    draft_filter=""
+    if [ "$INCLUDE_DRAFTS" = "true" ]; then
+        draft_filter="is:draft"
+    else
+        draft_filter="-is:draft"
+    fi
+
+   repos=()
+   for team in $teams; do
+     org=$(echo "$team" | cut -d'/' -f1)
+     team_slug=$(echo "$team" | cut -d'/' -f2)
+     while IFS= read -r repo; do
+       if [[ ! " ${repos[@]} " =~ " ${repo} " ]]; then
+         repos+=("$repo")
+       fi
+     done < <(gh repo list "$org" --topic "owner-$team_slug" --no-archived --json nameWithOwner --limit 1000 | jq -r '.[].nameWithOwner')
+   done
+
+   if [ ${#repos[@]} -eq 0 ]; then
+     echo "No repositories found for your teams" >&2
+     exit 0
+   fi
+
+   pr_data=$(printf '%s\n' "${repos[@]}" | xargs -P 50 -I {} gh pr list --state open --search "$draft_filter -author:app/renovate -author:app/dependabot -author:$current_user" --json number,title,author,createdAt,isDraft,url,headRepository --limit 100 --repo {} | jq -s 'add // []')
+
+   if [ "$INCLUDE_DRAFTS" = "true" ]; then
+     echo "$pr_data" | jq -r '.[] | [
+       ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
+       .title,
+       ("\u001b[33m" + .author.login + "\u001b[0m"),
+       "\u001b[35mDRAFT\u001b[0m",
+       ("\u001b[36m" + .url + "\u001b[0m")
+     ] | @tsv' | column -t -s $'\t'
+   else
+     echo "$pr_data" | jq -r '.[] | [
+       ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
+       .title,
+       ("\u001b[33m" + .author.login + "\u001b[0m"),
+       ("\u001b[36m" + .url + "\u001b[0m")
+     ] | @tsv' | column -t -s $'\t'
+   fi
 else
-  # Viewer's own PRs
   query='query {
     viewer {
       pullRequests(first: 100, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
@@ -94,22 +106,22 @@ else
       }
     }
   }'
-
   if [ "$INCLUDE_DRAFTS" = "true" ]; then
-    template='{{range .data.viewer.pullRequests.nodes -}}
-{{$draft := "" -}}
-{{if .isDraft -}}{{$draft = "DRAFT" -}}{{end -}}
-{{tablerow (printf "#%v" .number | autocolor "green") .title (.reviewDecision | autocolor "yellow") ($draft | autocolor "magenta") (.url | autocolor "cyan") -}}
-{{end -}}
-{{tablerender}}'
+    gh api graphql --paginate -f query="$query" --jq '.data.viewer.pullRequests.nodes[] | select(.isDraft)' | \
+    jq -r '[
+      ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
+      .title,
+      (.reviewDecision // "NONE" | "\u001b[33m" + . + "\u001b[0m"),
+      "\u001b[35mDRAFT\u001b[0m",
+      ("\u001b[36m" + .url + "\u001b[0m")
+    ] | @tsv' | column -t -s $'\t'
   else
-    template='{{range .data.viewer.pullRequests.nodes -}}
-{{if not .isDraft -}}
-{{tablerow (printf "#%v" .number | autocolor "green") .title (.reviewDecision | autocolor "yellow") (.url | autocolor "cyan") -}}
-{{end -}}
-{{end -}}
-{{tablerender}}'
+    gh api graphql --paginate -f query="$query" --jq '.data.viewer.pullRequests.nodes[] | select(.isDraft | not)' | \
+    jq -r '[
+      ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
+      .title,
+      (.reviewDecision // "NONE" | "\u001b[33m" + . + "\u001b[0m"),
+      ("\u001b[36m" + .url + "\u001b[0m")
+    ] | @tsv' | column -t -s $'\t'
   fi
 fi
-
-exec gh api graphql --paginate -f query="$query" -t "$template"
