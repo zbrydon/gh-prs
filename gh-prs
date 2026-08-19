@@ -1,8 +1,13 @@
 #!/bin/bash
 set -e
+set -o pipefail
 
 INCLUDE_DRAFTS=false
-REVIEW_REQUESTS=false
+# Query mode: mine | team_repos | review_requested
+MODE="mine"
+TEAMS=""
+# Author filter for team views: humans (default) | bots (Renovate/Dependabot only)
+AUTHORS="humans"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -11,16 +16,50 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --req)
-      REVIEW_REQUESTS=true
+      if [ "$MODE" = "review_requested" ]; then
+        echo "Error: --req and --rr are mutually exclusive" >&2
+        exit 1
+      fi
+      MODE="team_repos"
       shift
+      ;;
+    --rr|--review-requested)
+      if [ "$MODE" = "team_repos" ]; then
+        echo "Error: --req and --rr are mutually exclusive" >&2
+        exit 1
+      fi
+      MODE="review_requested"
+      shift
+      ;;
+    --renovate|--bots)
+      AUTHORS="bots"
+      shift
+      ;;
+    --teams)
+      if [ -z "$2" ] || [[ "$2" == -* ]]; then
+        echo "Error: --teams requires a value (comma-separated org/team-slug list)" >&2
+        exit 1
+      fi
+      TEAMS="$2"
+      shift 2
       ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo ""
       echo "Options:"
-      echo "  --drafts    Show ONLY draft PRs (mutually exclusive with non-drafts)"
-      echo "  --req       Show PRs where you're requested to review (default: your own PRs)"
-      echo "  -h, --help  Show this help message"
+      echo "  --drafts             Show ONLY draft PRs (mutually exclusive with non-drafts)"
+      echo "  --req                Show open PRs in your teams' repos (default: your own PRs)"
+      echo "  --rr,"
+      echo "  --review-requested   Show PRs where review is requested from you or your teams,"
+      echo "                       plus still-open PRs you have already reviewed (kept until"
+      echo "                       they merge or close)"
+      echo "  --renovate, --bots   In team views, show ONLY Renovate/Dependabot PRs instead of"
+      echo "                       human-raised ones (default: human-raised only). Implies --req"
+      echo "                       unless --rr is also given."
+      echo "  --teams <list>       Comma-separated list of teams (org/team-slug) to scope"
+      echo "                       --req/--rr to (default: your own teams). Implies --req"
+      echo "                       unless --rr is also given."
+      echo "  -h, --help           Show this help message"
       exit 0
       ;;
     *)
@@ -30,6 +69,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Specifying teams, or restricting authors to bots, only makes sense for
+# team-scoped queries. When no mode is chosen, default to the team-repo listing
+# (--req) for backwards compatibility.
+if { [ -n "$TEAMS" ] || [ "$AUTHORS" = "bots" ]; } && [ "$MODE" = "mine" ]; then
+  MODE="team_repos"
+fi
 
 if ! command -v gh &> /dev/null; then
   echo "Error: GitHub CLI (gh) is not installed" >&2
@@ -47,51 +93,182 @@ if ! command -v jq &> /dev/null; then
   exit 1
 fi
 
-if [ "$REVIEW_REQUESTS" = "true" ]; then
-    current_user=$(gh api user --jq '.login')
-    teams=$(gh api user/teams --jq '.[] | .organization.login + "/" + .slug')
+# Resolve the teams to query: the explicit --teams list if given, otherwise the
+# authenticated user's teams. Emits one "org/team-slug" per line.
+resolve_teams() {
+  if [ -n "$TEAMS" ]; then
+    echo "$TEAMS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  else
+    gh api user/teams --jq '.[] | .organization.login + "/" + .slug'
+  fi
+}
 
-    draft_filter=""
+# Render a normalised array of PRs as a coloured, aligned table.
+# Each element must contain: number, title, status, isDraft, url, createdAt.
+# Honours the global INCLUDE_DRAFTS to switch between draft-only and non-draft
+# views, adds an age column derived from createdAt, sorts longest-open first,
+# and aligns columns based on visible width (colours are applied after padding
+# so escape codes don't distort alignment).
+render_prs() {
+  local data="$1"
+  local drafts_only=false
+  [ "$INCLUDE_DRAFTS" = "true" ] && drafts_only=true
+
+  local out
+  out=$(echo "$data" | jq -r --argjson drafts_only "$drafts_only" '
+    def age($c):
+      if ($c // null) == null then "?"
+      else (now - ($c | fromdateiso8601)) as $s
+        | if   $s < 0        then "0m"
+          elif $s < 3600     then "\(($s / 60)       | floor)m"
+          elif $s < 86400    then "\(($s / 3600)     | floor)h"
+          elif $s < 604800   then "\(($s / 86400)    | floor)d"
+          elif $s < 2592000  then "\(($s / 604800)   | floor)w"
+          elif $s < 31536000 then "\(($s / 2592000)  | floor)mo"
+          else                    "\(($s / 31536000) | floor)y" end
+      end;
+    # ANSI colour code for a given column index, given the row length.
+    def colorof($i; $nf):
+      if   $i == 0             then "32"      # number  (green)
+      elif $i == 2             then "33"      # status  (yellow)
+      elif $i == 3             then "90"      # age     (grey)
+      elif $i == $nf - 1       then "36"      # url     (cyan)
+      elif $nf == 6 and $i == 4 then "35"     # DRAFT   (magenta)
+      else "" end;                            # title   (default)
+    # Pads to a codepoint count, not a display width: titles containing wide
+    # (CJK/emoji) or combining characters may not align perfectly.
+    def pad($s; $n): $s + (" " * ($n - ($s | length)));
+    ( sort_by(.createdAt // "9999")
+      | map(select(if $drafts_only then .isDraft else (.isDraft | not) end))
+      | map(
+          [ ("#" + (.number | tostring)), .title, (.status // ""), age(.createdAt) ]
+          + (if $drafts_only then ["DRAFT"] else [] end)
+          + [ .url ]
+        )
+    ) as $rows
+    | if ($rows | length) == 0 then empty
+      else
+        ($rows | transpose | map(map(length) | max)) as $w
+        | ($rows[0] | length) as $nf
+        | $rows[]
+        | . as $row
+        | [ range(0; $nf)
+            | . as $i
+            | (if $i == $nf - 1 then $row[$i] else pad($row[$i]; $w[$i]) end) as $cell
+            | colorof($i; $nf) as $col
+            | if $col == "" then $cell else "\u001b[\($col)m\($cell)\u001b[0m" end
+          ]
+        | join("  ")
+      end
+  ')
+
+  if [ -z "$out" ]; then
+    echo "No matching PRs found" >&2
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+# Every non-mine mode needs the current user (to exclude your own PRs).
+if [ "$MODE" != "mine" ]; then
+  current_user=$(gh api user --jq '.login')
+fi
+
+if [ "$MODE" = "review_requested" ]; then
+    # Build the set of GitHub search qualifiers to union together. These are
+    # passed as raw query terms (not the gh --review-requested flag, which only
+    # emits review-requested:USER and can't express team- or membership-based
+    # requests).
+    if [ -n "$TEAMS" ]; then
+      # Explicit --teams scoping: your direct requests plus each named team's,
+      # across every repository (whether your teams own it or not).
+      targets=("review-requested:@me")
+      while IFS= read -r team; do
+        [ -n "$team" ] && targets+=("team-review-requested:$team")
+      done <<< "$(resolve_teams)"
+    else
+      # Default: every PR requesting your review, whether requested directly or
+      # through any team you belong to, across all repositories. This is broader
+      # than review-requested:@me, which misses team-based requests.
+      targets=("user-review-requested:@me")
+    fi
+
+    # Also keep PRs you've already reviewed but that are still open. Submitting a
+    # review clears the pending request (notably reviews made on a team's
+    # behalf), which would otherwise make the PR disappear; including reviewed-by
+    # keeps it visible until it's merged or closed. --state open (below) bounds
+    # this to still-open PRs.
+    targets+=("reviewed-by:$current_user")
+
+    # Emit one JSON object per line (jq -c '.[]') from each parallel child so
+    # concurrent writes stay line-atomic under PIPE_BUF; a raw array per child
+    # can interleave above 4 KB and corrupt the stream that jq -s consumes.
+    pr_data=$(printf '%s\n' "${targets[@]}" \
+      | xargs -P 20 -I {} sh -c 'gh search prs "$1" --state open --json number,title,author,isDraft,url,createdAt --limit 100 | jq -c ".[]" || true' _ {} \
+      | jq -s --arg me "$current_user" --arg authors "$AUTHORS" '
+          unique_by(.url)
+          | map(select(
+              (.author.login != $me)
+              and (
+                (
+                  (.author.is_bot // false)
+                  or ((.author.login // "") | ascii_downcase | test("^(renovate|dependabot)"))
+                ) as $isbot
+                | if $authors == "bots" then $isbot else ($isbot | not) end
+              )
+            ))
+          | map({number, title, url, isDraft, createdAt, status: .author.login})
+        ')
+
+    render_prs "$pr_data"
+elif [ "$MODE" = "team_repos" ]; then
+    teams=$(resolve_teams)
+
     if [ "$INCLUDE_DRAFTS" = "true" ]; then
         draft_filter="is:draft"
     else
         draft_filter="-is:draft"
     fi
+    # Author filtering happens in jq below: combining multiple author: qualifiers
+    # in the search would AND them (matching nothing), so we filter on the
+    # returned author instead, using is_bot as the source of truth.
+    search_query="$draft_filter"
 
-   repos=()
-   for team in $teams; do
-     org=$(echo "$team" | cut -d'/' -f1)
-     team_slug=$(echo "$team" | cut -d'/' -f2)
-     while IFS= read -r repo; do
-       if [[ ! " ${repos[@]} " =~ " ${repo} " ]]; then
-         repos+=("$repo")
-       fi
-     done < <(gh repo list "$org" --topic "owner-$team_slug" --no-archived --json nameWithOwner --limit 1000 | jq -r '.[].nameWithOwner')
-   done
+    repos=()
+    while IFS= read -r team; do
+      [ -n "$team" ] || continue
+      org=$(echo "$team" | cut -d'/' -f1)
+      team_slug=$(echo "$team" | cut -d'/' -f2)
+      while IFS= read -r repo; do
+        case " ${repos[*]} " in
+          *" $repo "*) ;;
+          *) repos+=("$repo") ;;
+        esac
+      done < <(gh repo list "$org" --topic "owner-$team_slug" --no-archived --json nameWithOwner --limit 1000 | jq -r '.[].nameWithOwner')
+    done <<< "$teams"
 
-   if [ ${#repos[@]} -eq 0 ]; then
-     echo "No repositories found for your teams" >&2
-     exit 0
-   fi
+    if [ ${#repos[@]} -eq 0 ]; then
+      echo "No repositories found for your teams" >&2
+      exit 0
+    fi
 
-   pr_data=$(printf '%s\n' "${repos[@]}" | xargs -P 50 -I {} gh pr list --state open --search "$draft_filter -author:app/renovate -author:app/dependabot -author:$current_user" --json number,title,author,createdAt,isDraft,url,headRepository --limit 100 --repo {} | jq -s 'add // []')
+    # See the review_requested branch: stream one object per line so parallel
+    # writes stay line-atomic under PIPE_BUF instead of interleaving arrays.
+    pr_data=$(printf '%s\n' "${repos[@]}" \
+      | xargs -P 50 -I {} sh -c 'gh pr list --state open --search "$2" --json number,title,author,createdAt,isDraft,url,headRepository --limit 100 --repo "$1" | jq -c ".[]" || true' _ {} "$search_query" \
+      | jq -s --arg authors "$AUTHORS" --arg me "$current_user" '
+          map(select(
+              (
+                (.author.is_bot // false)
+                or ((.author.login // "") | ascii_downcase | test("^(renovate|dependabot)"))
+              ) as $isbot
+              | if $authors == "bots" then $isbot
+                else (($isbot | not) and (.author.login != $me)) end
+            ))
+          | map({number, title, url, isDraft, createdAt, status: .author.login})
+        ')
 
-   if [ "$INCLUDE_DRAFTS" = "true" ]; then
-     echo "$pr_data" | jq -r '.[] | [
-       ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
-       .title,
-       ("\u001b[33m" + .author.login + "\u001b[0m"),
-       "\u001b[35mDRAFT\u001b[0m",
-       ("\u001b[36m" + .url + "\u001b[0m")
-     ] | @tsv' | column -t -s $'\t'
-   else
-     echo "$pr_data" | jq -r '.[] | [
-       ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
-       .title,
-       ("\u001b[33m" + .author.login + "\u001b[0m"),
-       ("\u001b[36m" + .url + "\u001b[0m")
-     ] | @tsv' | column -t -s $'\t'
-   fi
+    render_prs "$pr_data"
 else
   query='query {
     viewer {
@@ -102,26 +279,13 @@ else
           reviewDecision
           isDraft
           url
+          createdAt
         }
       }
     }
   }'
-  if [ "$INCLUDE_DRAFTS" = "true" ]; then
-    gh api graphql --paginate -f query="$query" --jq '.data.viewer.pullRequests.nodes[] | select(.isDraft)' | \
-    jq -r '[
-      ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
-      .title,
-      (.reviewDecision // "NONE" | "\u001b[33m" + . + "\u001b[0m"),
-      "\u001b[35mDRAFT\u001b[0m",
-      ("\u001b[36m" + .url + "\u001b[0m")
-    ] | @tsv' | column -t -s $'\t'
-  else
-    gh api graphql --paginate -f query="$query" --jq '.data.viewer.pullRequests.nodes[] | select(.isDraft | not)' | \
-    jq -r '[
-      ("\u001b[32m#" + (.number | tostring) + "\u001b[0m"),
-      .title,
-      (.reviewDecision // "NONE" | "\u001b[33m" + . + "\u001b[0m"),
-      ("\u001b[36m" + .url + "\u001b[0m")
-    ] | @tsv' | column -t -s $'\t'
-  fi
+  pr_data=$(gh api graphql -f query="$query" --jq '.data.viewer.pullRequests.nodes' \
+    | jq -s 'add // [] | map({number, title, url, isDraft, createdAt, status: (.reviewDecision // "NONE")})')
+
+  render_prs "$pr_data"
 fi
